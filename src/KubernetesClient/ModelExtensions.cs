@@ -137,10 +137,7 @@ namespace k8s.Models
             string apiVersion = obj.ApiVersion, kind = obj.Kind; // default to using the API version and kind from the object
             if(string.IsNullOrEmpty(apiVersion) || string.IsNullOrEmpty(kind)) // but if either of them is missing...
             {
-                object[] attrs = obj.GetType().GetCustomAttributes(typeof(KubernetesEntityAttribute), true);
-                if(attrs.Length == 0) throw new ArgumentException("Unable to determine the object's API version and Kind.");
-                var attr = (KubernetesEntityAttribute)attrs[0];
-                (apiVersion, kind) = (string.IsNullOrEmpty(attr.Group) ? attr.ApiVersion : attr.Group + "/" + attr.ApiVersion, attr.Kind);
+                KubernetesScheme.Default.GetVK(obj.GetType(), out apiVersion, out kind); // get it from the default scheme
             }
             return new V1ObjectReference()
             {
