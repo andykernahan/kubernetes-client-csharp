@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using k8s.Models;
@@ -267,7 +268,7 @@ namespace k8s
         /// <inheritdoc/>
         public void Dispose()
         {
-            streamReader?.Dispose();
+            reader?.Close();
             Response?.Dispose();
         }
 
@@ -281,7 +282,7 @@ namespace k8s
             if (reader == null) CreateReader(await Response.Content.ReadAsStreamAsync().ConfigureAwait(false));
             try
             {
-                streamReader.CancelToken = cancelToken;
+                cancelableStream.CancellationToken = cancelToken;
 #if !NET452
                 if (!await reader.ReadAsync(cancelToken).ConfigureAwait(false)) return null; // wait for the next event
 #else
@@ -335,155 +336,18 @@ namespace k8s
             return e;
         }
 
-        #region CancelableStreamReader
-        // HACK: annoyingly, the TextReader interface doesn't support cancellation of async reads outside .NET core. furthermore, Json.NET
-        // doesn't support cancellation even in several versions of .NET core. so we have this hacky TextReader that attempts cancellation
-        sealed class CancelableStreamReader : TextReader
-        {
-            public CancelableStreamReader(Stream stream) => this.stream = stream;
-
-            // the CancellationToken used to cancel reads
-            public CancellationToken CancelToken { get; set; }
-
-            public override int Peek() => EnsureData() ? charBuffer[charRead] : -1;
-            public override int Read() => EnsureData() ? charBuffer[charRead++] : -1;
-            public override int Read(char[] buffer, int index, int count) => Read(buffer, index, count, false);
-
-#if NETCOREAPP2_1
-            public override ValueTask<int> ReadAsync(Memory<char> buffer, CancellationToken _) => ReadAsync(buffer, false);
-
-            public override Task<int> ReadAsync(char[] buffer, int index, int count) =>
-                ReadAsync(buffer.AsMemory(index, count), false).AsTask();
-
-            public override ValueTask<int> ReadBlockAsync(Memory<char> buffer, CancellationToken _) => ReadAsync(buffer, true);
-
-            public override Task<int> ReadBlockAsync(char[] buffer, int index, int count) =>
-                ReadAsync(buffer.AsMemory(index, count), true).AsTask();
-#else
-            public override Task<int> ReadAsync(char[] buffer, int index, int count) => ReadAsync(buffer, index, count, false);
-            public override Task<int> ReadBlockAsync(char[] buffer, int index, int count) => ReadAsync(buffer, index, count, true);
-#endif
-
-            public override string ReadToEnd()
-            {
-                var sb = new System.Text.StringBuilder(4096);
-                while(EnsureData())
-                {
-                    sb.Append(charBuffer, charRead, charWrite-charRead);
-                    charRead = charWrite;
-                }
-                return sb.ToString();
-            }
-
-            public async override Task<string> ReadToEndAsync()
-            {
-                var sb = new System.Text.StringBuilder(4096);
-                while(await EnsureDataAsync().ConfigureAwait(false))
-                {
-                    sb.Append(charBuffer, charRead, charWrite-charRead);
-                    charRead = charWrite;
-                }
-                return sb.ToString();
-            }
-
-            protected override void Dispose(bool disposing)
-            {
-                base.Dispose(disposing);
-                stream?.Dispose();
-            }
-
-            bool EnsureData()
-            {
-                if (charRead == charWrite)
-                {
-                    try { return EnsureDataAsync().GetAwaiter().GetResult(); }
-                    catch (OperationCanceledException) { return false; } // non-async callers aren't expecting OperationCanceledException
-                }
-                return true;
-            }
-
-            async Task<bool> EnsureDataAsync()
-            {
-                if (charRead == charWrite)
-                {
-                    CancelToken.ThrowIfCancellationRequested();
-                    charRead = charWrite = 0;
-                    do
-                    {
-                        int bytesRead = await stream.ReadAsync(byteBuffer, 0, byteBuffer.Length, CancelToken).ConfigureAwait(false);
-                        if (bytesRead == 0) return false;
-                        charWrite = decoder.GetChars(byteBuffer, 0, bytesRead, charBuffer, 0);
-                    } while(charWrite == 0);
-                }
-                return true;
-            }
-
-            int Read(char[] buffer, int index, int count, bool block)
-            {
-                int start = index;
-                while(count != 0 && EnsureData())
-                {
-                    int toRead = Math.Min(count, charWrite-charRead);
-                    Array.Copy(charBuffer, charRead, buffer, index, toRead);
-                    charRead += toRead;
-                    index += toRead;
-                    if (!block) break;
-                    count -= toRead;
-                }
-                return index - start;
-            }
-
-#if NETCOREAPP2_1
-            async ValueTask<int> ReadAsync(Memory<char> buffer, bool block)
-            {
-                int totalRead = 0;
-                while(buffer.Length != 0 && (charRead != charWrite || await EnsureDataAsync().ConfigureAwait(false)))
-                {
-                    int toRead = Math.Min(buffer.Length, charWrite-charRead);
-                    charBuffer.AsSpan(charRead, toRead).CopyTo(buffer.Span);
-                    totalRead += toRead;
-                    charRead += toRead;
-                    if (!block) break;
-                    buffer = buffer.Slice(toRead);
-                }
-                return totalRead;
-            }
-#else
-            async Task<int> ReadAsync(char[] buffer, int index, int count, bool block)
-            {
-                int start = index;
-                while(count != 0 && (charRead != charWrite || await EnsureDataAsync().ConfigureAwait(false)))
-                {
-                    int toRead = Math.Min(count, charWrite-charRead);
-                    Array.Copy(charBuffer, charRead, buffer, index, toRead);
-                    charRead += toRead;
-                    index += toRead;
-                    if (!block) break;
-                    count -= toRead;
-                }
-                return index - start;
-            }
-#endif
-
-            readonly Stream stream;
-            readonly System.Text.Decoder decoder = System.Text.Encoding.UTF8.GetDecoder();
-            readonly char[] charBuffer = new char[4096];
-            readonly byte[] byteBuffer = new byte[4096];
-            int charRead, charWrite;
-        }
-#endregion
-
         void CreateReader(Stream stream)
         {
-            streamReader = new CancelableStreamReader(stream);
-            reader = new JsonTextReader(streamReader);
+            cancelableStream = new WatcherDelegatingHandler.CancelableStream(stream, default);
+            reader = new JsonTextReader(
+                new StreamReader(cancelableStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096));
             reader.SupportMultipleContent = true; // we'll be reading multiple objects out of the stream
             serializer = JsonSerializer.Create(Kubernetes.DefaultJsonSettings);
         }
 
         JsonTextReader reader;
         JsonSerializer serializer;
-        CancelableStreamReader streamReader;
+        WatcherDelegatingHandler.CancelableStream cancelableStream;
 
         static EndOfStreamException EOFError() => new EndOfStreamException("Unexpected end of the watch stream.");
     }

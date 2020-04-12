@@ -37,16 +37,17 @@ namespace k8s
         internal class CancelableStream : Stream
         {
             private readonly Stream _innerStream;
-            private readonly CancellationToken _cancellationToken;
 
             public CancelableStream(Stream innerStream, CancellationToken cancellationToken)
             {
                 _innerStream = innerStream;
-                _cancellationToken = cancellationToken;
+                CancellationToken = cancellationToken;
             }
 
+            public CancellationToken CancellationToken { get; set; }
+
             public override void Flush() =>
-                _innerStream.FlushAsync(_cancellationToken).GetAwaiter().GetResult();
+                _innerStream.FlushAsync(CancellationToken).GetAwaiter().GetResult();
 
             public override async Task FlushAsync(CancellationToken cancellationToken)
             {
@@ -57,7 +58,7 @@ namespace k8s
             }
 
             public override int Read(byte[] buffer, int offset, int count) =>
-                _innerStream.ReadAsync(buffer, offset, count, _cancellationToken).GetAwaiter().GetResult();
+                _innerStream.ReadAsync(buffer, offset, count, CancellationToken).GetAwaiter().GetResult();
 
             public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
             {
@@ -72,7 +73,7 @@ namespace k8s
             public override void SetLength(long value) => _innerStream.SetLength(value);
 
             public override void Write(byte[] buffer, int offset, int count) =>
-                _innerStream.WriteAsync(buffer, offset, count, _cancellationToken).GetAwaiter().GetResult();
+                _innerStream.WriteAsync(buffer, offset, count, CancellationToken).GetAwaiter().GetResult();
 
             public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
             {
@@ -107,7 +108,7 @@ namespace k8s
 
             private LinkedCancellationTokenSource CreateCancellationTokenSource(CancellationToken userCancellationToken)
             {
-                return new LinkedCancellationTokenSource(_cancellationToken, userCancellationToken);
+                return new LinkedCancellationTokenSource(CancellationToken, userCancellationToken);
             }
 
             private readonly struct LinkedCancellationTokenSource : IDisposable
